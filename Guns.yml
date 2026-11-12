@@ -1,0 +1,2005 @@
+name: Build Guns
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_preset:
+        description: 'Пресет положения оружия в руке (1-4), см. PRESETS в gen_pack.py'
+        required: false
+        default: '1'
+        type: choice
+        options: ['1', '2', '3', '4']
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ------------------------------------------------------------------
+      # 1. Проект: pom.xml, plugin.yml, config.yml, weapons.yml
+      # ------------------------------------------------------------------
+      - name: Write project descriptors
+        run: |
+          set -e
+          mkdir -p src/main/java/ru/eclips/guns src/main/resources staging
+
+          cat > pom.xml <<'POM_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>ru.eclips</groupId>
+            <artifactId>Guns</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <repositories>
+              <repository>
+                <id>lanink</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+                <releases><enabled>true</enabled></releases>
+                <snapshots><enabled>true</enabled></snapshots>
+              </repository>
+              <repository>
+                <id>opencollab-snapshots</id>
+                <url>https://repo.opencollab.dev/maven-snapshots/</url>
+                <releases><enabled>true</enabled></releases>
+                <snapshots><enabled>true</enabled></snapshots>
+              </repository>
+            </repositories>
+            <dependencies>
+              <dependency>
+                <groupId>cn.nukkit</groupId>
+                <artifactId>Nukkit</artifactId>
+                <version>MOT-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+            <build>
+              <finalName>Guns</finalName>
+              <resources>
+                <resource>
+                  <directory>src/main/resources</directory>
+                  <filtering>false</filtering>
+                </resource>
+              </resources>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.11.0</version>
+                  <configuration>
+                    <source>17</source>
+                    <target>17</target>
+                    <encoding>UTF-8</encoding>
+                  </configuration>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          POM_EOF
+
+          cat > src/main/resources/plugin.yml <<'PLUGIN_EOF'
+          name: Guns
+          main: ru.eclips.guns.Guns
+          version: 1.0.0
+          api: ["1.0.0"]
+          author: eclips
+          description: 3D firearms (hitscan) with custom items and resource pack
+          load: STARTUP
+          softdepend: [MyRegions]
+          commands:
+            gun:
+              description: Guns administration
+              usage: /gun <give|reload>
+              permission: gun.admin
+          permissions:
+            gun.admin:
+              description: Guns administration (give, reload)
+              default: false
+          PLUGIN_EOF
+
+          cat > src/main/resources/config.yml <<'CONFIG_EOF'
+          # Миры, где стрельба запрещена (без учёта регистра)
+          disabled_worlds:
+            - hub
+
+          # Автоогонь: сколько мс после последнего клика ПКМ считать, что кнопка удерживается
+          auto_hold_timeout_ms: 300
+
+          # Доля высоты цели сверху, попадание в которую считается выстрелом в голову (0.8 = верхние 20%)
+          headshot_fraction: 0.8
+
+          # Показывать магазин/запас над хотбаром
+          hud: true
+
+          # /gun give <ник> <оружие>: выдавать вместе с оружием патроны в количестве reserve из weapons.yml
+          give_reserve_with_weapon: false
+
+          messages:
+            no_ammo: "§cНет патронов: {ammo}"
+            reloading: "§eПерезарядка..."
+            reloaded: "§aПерезаряжено"
+            reload_cancelled: "§cПерезарядка отменена"
+            empty: "§cМагазин пуст. Выбросьте оружие (Q) для перезарядки"
+            full: "§7Магазин полон"
+            no_fire_zone: "§cЗдесь стрелять нельзя"
+            no_perm: "§cНет прав"
+            no_player: "§cИгрок {player} не найден"
+            unknown_item: "§cНеизвестный предмет: {id}"
+            bad_count: "§cКоличество должно быть от 1 до 576"
+            usage: "§cИспользование: /gun give <ник> <оружие|патроны> [количество] | /gun reload"
+            given: "§aВыдано {player}: {id} x{count}"
+            reloaded_cfg: "§aКонфиги Guns перезагружены"
+          CONFIG_EOF
+
+          cat > src/main/resources/weapons.yml <<'WEAPONS_EOF'
+          # Весь урон в HP (20 HP = 10 сердец). Изменения применяются командой /gun reload.
+          # Перезагружаются: урон, магазин, скорострельность, разброс, отдача, звуки, эффекты.
+          # НЕ перезагружаются без рестарта: идентификаторы, названия и размер стака (регистрируются один раз).
+          #
+          # mode: semi (один выстрел за клик) | auto (удержание) | bolt (затворная)
+          # shots_per_second: максимальная скорострельность (AWM 0.5 = раз в 2 секунды)
+          # spread: градусы. base - в покое, per_shot - прирост за выстрел очереди, max - потолок,
+          #         recover_ms - пауза, после которой разброс сбрасывается
+          # recoil: pitch - подброс прицела вверх за выстрел (градусы), yaw - случайный увод вбок
+          # trail: none | smoke | flame | critical; trail_step - шаг частиц вдоль луча (блоки)
+          reserve_note: "reserve - справочное число патронов (используется при give_reserve_with_weapon)"
+
+          ammo:
+            "eclips:ammo_9x19":
+              name: "Патроны 9x19 мм"
+            "eclips:ammo_762x39":
+              name: "Патроны 7.62x39 мм"
+            "eclips:ammo_338_lapua":
+              name: "Патроны .338 Lapua Magnum"
+
+          weapons:
+            "eclips:glock_17":
+              name: "Glock 17"
+              ammo: "eclips:ammo_9x19"
+              damage: 5
+              headshot_multiplier: 1.5
+              magazine: 17
+              reserve: 68
+              mode: semi
+              shots_per_second: 3
+              reload_seconds: 1.5
+              range: 40
+              spread:
+                base: 0.4
+                per_shot: 0.0
+                max: 0.4
+                recover_ms: 300
+              recoil:
+                pitch: 1.5
+                yaw: 0.3
+              scope:
+                enabled: false
+              sounds:
+                shot: "eclips.glock_17.shot"
+                empty: "eclips.gun.empty"
+                reload: "eclips.glock_17.reload"
+              effects:
+                muzzle_flash: true
+                trail: smoke
+                trail_step: 3.0
+
+            "eclips:mp5":
+              name: "MP5"
+              ammo: "eclips:ammo_9x19"
+              damage: 3
+              headshot_multiplier: 1.5
+              magazine: 30
+              reserve: 120
+              mode: auto
+              shots_per_second: 10
+              reload_seconds: 2.0
+              range: 30
+              spread:
+                base: 0.5
+                per_shot: 0.35
+                max: 4.0
+                recover_ms: 350
+              recoil:
+                pitch: 0.9
+                yaw: 0.4
+              scope:
+                enabled: false
+              sounds:
+                shot: "eclips.mp5.shot"
+                empty: "eclips.gun.empty"
+                reload: "eclips.mp5.reload"
+              effects:
+                muzzle_flash: true
+                trail: critical
+                trail_step: 3.0
+
+            "eclips:ak_47":
+              name: "AK-47"
+              ammo: "eclips:ammo_762x39"
+              damage: 5
+              headshot_multiplier: 1.5
+              magazine: 30
+              reserve: 120
+              mode: auto
+              shots_per_second: 7
+              reload_seconds: 2.5
+              range: 60
+              spread:
+                base: 0.6
+                per_shot: 0.4
+                max: 5.0
+                recover_ms: 400
+              recoil:
+                pitch: 2.2
+                yaw: 0.7
+              scope:
+                enabled: false
+              sounds:
+                shot: "eclips.ak_47.shot"
+                empty: "eclips.gun.empty"
+                reload: "eclips.ak_47.reload"
+              effects:
+                muzzle_flash: true
+                trail: flame
+                trail_step: 3.5
+
+            "eclips:awm":
+              name: "AWM"
+              ammo: "eclips:ammo_338_lapua"
+              damage: 25
+              headshot_multiplier: 2.0
+              magazine: 5
+              reserve: 20
+              mode: bolt
+              shots_per_second: 0.5
+              reload_seconds: 3.5
+              range: 120
+              spread:
+                base: 3.0
+                per_shot: 0.0
+                max: 3.0
+                recover_ms: 1000
+              recoil:
+                pitch: 4.0
+                yaw: 0.2
+              scope:
+                enabled: true
+                slowness_level: 3
+                spread_mult: 0.0
+              sounds:
+                shot: "eclips.awm.shot"
+                empty: "eclips.gun.empty"
+                reload: "eclips.awm.reload"
+              effects:
+                muzzle_flash: true
+                trail: smoke
+                trail_step: 2.5
+          WEAPONS_EOF
+
+      # ------------------------------------------------------------------
+      # 2. Java: интерфейсы, конфиг, предметы, логика
+      # ------------------------------------------------------------------
+      - name: Write Java sources
+        run: |
+          set -e
+          D=src/main/java/ru/eclips/guns
+
+          cat > $D/GunMarker.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          /** Маркер для наших кастомных предметов: возвращает идентификатор вида eclips:glock_17. */
+          public interface GunMarker {
+              String gunId();
+          }
+          JAVA_EOF
+
+          cat > $D/Weapon.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          public final class Weapon {
+              public enum Mode { SEMI, AUTO, BOLT }
+
+              public String id;
+              public String name;
+              public String ammoId;
+              public double damage;
+              public double headMult;
+              public int magazine;
+              public int reserve;
+              public Mode mode = Mode.SEMI;
+              public long intervalMs;
+              public long reloadMs;
+              public double range;
+              public double spreadBase;
+              public double spreadPerShot;
+              public double spreadMax;
+              public long spreadRecoverMs;
+              public double recoilPitch;
+              public double recoilYaw;
+              public boolean scope;
+              public int scopeSlowness;
+              public double scopedSpreadMult;
+              public String soundShot;
+              public String soundEmpty;
+              public String soundReload;
+              public boolean muzzleFlash;
+              public String trail;
+              public double trailStep;
+          }
+          JAVA_EOF
+
+          cat > $D/WeaponRegistry.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.utils.Config;
+          import cn.nukkit.utils.ConfigSection;
+
+          import java.io.File;
+          import java.util.*;
+
+          public final class WeaponRegistry {
+              public static final String[] AMMO_IDS = {
+                      "eclips:ammo_9x19", "eclips:ammo_762x39", "eclips:ammo_338_lapua"
+              };
+              private static final String[] AMMO_DEFAULT_NAMES = {
+                      "Патроны 9x19 мм", "Патроны 7.62x39 мм", "Патроны .338 Lapua Magnum"
+              };
+
+              private final Guns plugin;
+              private final Map<String, Weapon> weapons = new LinkedHashMap<>();
+              private final Map<String, String> ammoNames = new LinkedHashMap<>();
+
+              public WeaponRegistry(Guns plugin) {
+                  this.plugin = plugin;
+              }
+
+              public void load() {
+                  Map<String, Weapon> newWeapons = new LinkedHashMap<>();
+                  Map<String, String> newAmmo = new LinkedHashMap<>();
+                  for (int i = 0; i < AMMO_IDS.length; i++) newAmmo.put(AMMO_IDS[i], AMMO_DEFAULT_NAMES[i]);
+                  try {
+                      Config cfg = new Config(new File(plugin.getDataFolder(), "weapons.yml"), Config.YAML);
+                      ConfigSection ammo = cfg.getSection("ammo");
+                      for (String id : ammo.getKeys(false)) {
+                          newAmmo.put(id, ammo.getSection(id).getString("name", id));
+                      }
+                      ConfigSection ws = cfg.getSection("weapons");
+                      for (String id : ws.getKeys(false)) {
+                          try {
+                              newWeapons.put(id, parse(id, ws.getSection(id)));
+                          } catch (Exception e) {
+                              plugin.getLogger().error("weapons.yml: ошибка в оружии " + id + ": " + e);
+                          }
+                      }
+                  } catch (Exception e) {
+                      plugin.getLogger().error("Не удалось прочитать weapons.yml: " + e);
+                      return;
+                  }
+                  weapons.clear();
+                  weapons.putAll(newWeapons);
+                  ammoNames.clear();
+                  ammoNames.putAll(newAmmo);
+              }
+
+              private static double num(ConfigSection s, String key, double def) {
+                  Object o = s.get(key);
+                  return o instanceof Number ? ((Number) o).doubleValue() : def;
+              }
+
+              private Weapon parse(String id, ConfigSection s) {
+                  Weapon w = new Weapon();
+                  w.id = id;
+                  w.name = s.getString("name", id);
+                  w.ammoId = s.getString("ammo", "");
+                  w.damage = num(s, "damage", 5);
+                  w.headMult = num(s, "headshot_multiplier", 1.5);
+                  w.magazine = Math.max(1, (int) num(s, "magazine", 10));
+                  w.reserve = Math.max(0, (int) num(s, "reserve", 0));
+                  String m = s.getString("mode", "semi").toLowerCase(Locale.ROOT);
+                  w.mode = m.equals("auto") ? Weapon.Mode.AUTO : m.equals("bolt") ? Weapon.Mode.BOLT : Weapon.Mode.SEMI;
+                  double sps = Math.max(0.1, num(s, "shots_per_second", 2));
+                  w.intervalMs = (long) (1000.0 / sps);
+                  w.reloadMs = (long) (num(s, "reload_seconds", 2) * 1000);
+                  w.range = Math.max(5, num(s, "range", 40));
+
+                  ConfigSection sp = s.getSection("spread");
+                  w.spreadBase = num(sp, "base", 0.5);
+                  w.spreadPerShot = num(sp, "per_shot", 0);
+                  w.spreadMax = Math.max(w.spreadBase, num(sp, "max", w.spreadBase));
+                  w.spreadRecoverMs = (long) num(sp, "recover_ms", 300);
+
+                  ConfigSection rc = s.getSection("recoil");
+                  w.recoilPitch = num(rc, "pitch", 1);
+                  w.recoilYaw = num(rc, "yaw", 0.2);
+
+                  ConfigSection sc = s.getSection("scope");
+                  Object en = sc.get("enabled");
+                  w.scope = en instanceof Boolean && (Boolean) en;
+                  w.scopeSlowness = (int) num(sc, "slowness_level", 3);
+                  w.scopedSpreadMult = num(sc, "spread_mult", 0.0);
+
+                  ConfigSection so = s.getSection("sounds");
+                  w.soundShot = so.getString("shot", "");
+                  w.soundEmpty = so.getString("empty", "random.click");
+                  w.soundReload = so.getString("reload", "");
+
+                  ConfigSection fx = s.getSection("effects");
+                  Object mf = fx.get("muzzle_flash");
+                  w.muzzleFlash = !(mf instanceof Boolean) || (Boolean) mf;
+                  w.trail = fx.getString("trail", "smoke").toLowerCase(Locale.ROOT);
+                  w.trailStep = num(fx, "trail_step", 3.0);
+                  return w;
+              }
+
+              public Weapon weapon(String id) { return id == null ? null : weapons.get(id); }
+              public Collection<Weapon> weapons() { return weapons.values(); }
+              public boolean isAmmo(String id) { return id != null && ammoNames.containsKey(id); }
+              public String ammoName(String id) { return ammoNames.getOrDefault(id, id); }
+          }
+          JAVA_EOF
+
+          cat > $D/GunItems.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.item.Item;
+          import cn.nukkit.nbt.tag.CompoundTag;
+
+          /** Создание предметов и работа с NBT (идентификатор и магазин). */
+          public final class GunItems {
+              public static final String TAG_ID = "eclips_id";
+              public static final String TAG_MAG = "eclips_mag";
+
+              private GunItems() {}
+
+              /** Идентификатор нашего предмета или null. Работает и для предметов из креатива (без NBT). */
+              public static String idOf(Item item) {
+                  if (item == null || item.isNull()) return null;
+                  if (item instanceof GunMarker) return ((GunMarker) item).gunId();
+                  CompoundTag t = item.getNamedTag();
+                  if (t != null && t.contains(TAG_ID)) return t.getString(TAG_ID);
+                  return null;
+              }
+
+              /** Патронов в магазине. Нет тега (предмет из креатива) = полный магазин. */
+              public static int mag(Item item, Weapon w) {
+                  CompoundTag t = item.getNamedTag();
+                  if (t != null && t.contains(TAG_MAG)) {
+                      return Math.max(0, Math.min(w.magazine, t.getInt(TAG_MAG)));
+                  }
+                  return w.magazine;
+              }
+
+              public static Item withMag(Item item, int mag) {
+                  CompoundTag t = item.getNamedTag();
+                  if (t == null) t = new CompoundTag();
+                  t.putInt(TAG_MAG, mag);
+                  item.setNamedTag(t);
+                  return item;
+              }
+
+              private static void tagId(Item item, String id) {
+                  CompoundTag t = item.getNamedTag();
+                  if (t == null) t = new CompoundTag();
+                  t.putString(TAG_ID, id);
+                  item.setNamedTag(t);
+              }
+
+              public static Item weapon(Weapon w) {
+                  Item it = CustomItems.create(w.id);
+                  if (it == null) it = fallback(w.id, w.name);
+                  it.setCount(1);
+                  tagId(it, w.id);
+                  withMag(it, w.magazine);
+                  return it;
+              }
+
+              public static Item ammo(String id, int count, String displayName) {
+                  Item it = CustomItems.create(id);
+                  if (it == null) it = fallback(id, displayName);
+                  it.setCount(Math.max(1, Math.min(64, count)));
+                  tagId(it, id);
+                  return it;
+              }
+
+              /** Запасной вариант, если кастомные предметы не зарегистрировались: ванильные предметы с NBT. */
+              private static Item fallback(String id, String name) {
+                  int legacy;
+                  switch (id) {
+                      case "eclips:glock_17": legacy = 291; break;   // каменная мотыга
+                      case "eclips:mp5": legacy = 292; break;        // железная мотыга
+                      case "eclips:ak_47": legacy = 294; break;      // золотая мотыга
+                      case "eclips:awm": legacy = 293; break;        // алмазная мотыга
+                      case "eclips:ammo_9x19": legacy = 452; break;  // железный самородок
+                      case "eclips:ammo_762x39": legacy = 371; break;// золотой самородок
+                      default: legacy = 289; break;                  // порох
+                  }
+                  Item it = Item.get(legacy);
+                  it.setCustomName("§r§f" + name);
+                  return it;
+              }
+          }
+          JAVA_EOF
+
+          cat > $D/RegionAdapter.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.math.Vector3;
+
+          /**
+           * Адаптер интеграции с MyRegions.
+           *
+           * API MyRegions мне не известно, поэтому здесь РАБОЧАЯ ЗАГЛУШКА: стрельба везде разрешена.
+           * Всё, что нужно подключить вручную, находится ТОЛЬКО в методе isPvpAllowed().
+           */
+          public final class RegionAdapter {
+              /** Поменяйте на true после подключения реального API (используется только для лога). */
+              public static final boolean INTEGRATED = false;
+
+              private final Guns plugin;
+
+              public RegionAdapter(Guns plugin) {
+                  this.plugin = plugin;
+                  if (!INTEGRATED) {
+                      plugin.getLogger().warning("MyRegions: интеграция не подключена (заглушка), стрельба в регионах без PvP НЕ блокируется. См. RegionAdapter.isPvpAllowed().");
+                  }
+              }
+
+              /**
+               * HOOK: вернуть false, если в точке {@code at} регион MyRegions с выключенным PvP-флагом.
+               * Вызывается для позиции стрелка перед выстрелом и для позиции цели перед нанесением урона.
+               * Пример (псевдокод, НЕ реальный API): region = MyRegions.getRegionAt(at); return region == null || region.getFlag("pvp");
+               */
+              public boolean isPvpAllowed(Player shooter, Vector3 at) {
+                  return true;
+              }
+          }
+          JAVA_EOF
+
+          cat > $D/Reflect.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import java.lang.reflect.Field;
+
+          final class Reflect {
+              private Reflect() {}
+
+              /** Тихо выставляет int-поле (ищет по иерархии классов). Нужен, чтобы сбросить кадры неуязвимости после урона. */
+              static void setInt(Object o, String name, int value) {
+                  Class<?> c = o.getClass();
+                  while (c != null) {
+                      try {
+                          Field f = c.getDeclaredField(name);
+                          f.setAccessible(true);
+                          if (f.getType() == int.class) f.setInt(o, value);
+                          return;
+                      } catch (NoSuchFieldException e) {
+                          c = c.getSuperclass();
+                      } catch (Throwable t) {
+                          return;
+                      }
+                  }
+              }
+          }
+          JAVA_EOF
+
+          cat > $D/Fx.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.particle.CriticalParticle;
+          import cn.nukkit.level.particle.FlameParticle;
+          import cn.nukkit.level.particle.Particle;
+          import cn.nukkit.level.particle.SmokeParticle;
+          import cn.nukkit.math.Vector3;
+          import cn.nukkit.network.protocol.MovePlayerPacket;
+          import cn.nukkit.network.protocol.PlaySoundPacket;
+
+          /** Звуки, частицы, отдача. */
+          public final class Fx {
+              private Fx() {}
+
+              public static void sound(Player src, String name, float volume, float pitch) {
+                  if (name == null || name.isEmpty()) return;
+                  Level lv = src.getLevel();
+                  for (Player o : lv.getPlayers().values()) {
+                      if (o.distanceSquared(src) > 64 * 64) continue;
+                      PlaySoundPacket pk = new PlaySoundPacket();
+                      pk.name = name;
+                      pk.x = (int) src.getX();
+                      pk.y = (int) src.getY();
+                      pk.z = (int) src.getZ();
+                      pk.volume = volume;
+                      pk.pitch = pitch;
+                      o.dataPacket(pk);
+                  }
+              }
+
+              public static void trail(Level lv, Weapon w, double ex, double ey, double ez,
+                                       double dx, double dy, double dz, double end) {
+                  String tp = w.trail;
+                  if (tp == null || tp.equals("none")) return;
+                  double step = Math.max(0.5, w.trailStep);
+                  for (double t = 1.5; t < end; t += step) {
+                      Vector3 v = new Vector3(ex + dx * t, ey + dy * t, ez + dz * t);
+                      Particle pt;
+                      switch (tp) {
+                          case "flame": pt = new FlameParticle(v); break;
+                          case "critical": pt = new CriticalParticle(v); break;
+                          default: pt = new SmokeParticle(v); break;
+                      }
+                      lv.addParticle(pt);
+                  }
+              }
+
+              public static void muzzle(Level lv, Weapon w, double yawDeg, double ex, double ey, double ez,
+                                        double dx, double dy, double dz) {
+                  if (!w.muzzleFlash) return;
+                  double yr = Math.toRadians(yawDeg);
+                  double rx = -Math.cos(yr), rz = -Math.sin(yr);
+                  Vector3 m = new Vector3(ex + dx * 1.0 + rx * 0.2, ey + dy * 1.0 - 0.2, ez + dz * 1.0 + rz * 0.2);
+                  lv.addParticle(new FlameParticle(m));
+                  lv.addParticle(new SmokeParticle(m));
+              }
+
+              /** Отдача: подбрасывает прицел вверх и немного в сторону, синхронизирует камеру клиента. */
+              public static void recoil(Player p, double pitchKick, double yawKick) {
+                  float np = (float) Math.max(-90.0, p.getPitch() - pitchKick);
+                  float ny = (float) (p.getYaw() + (Math.random() * 2 - 1) * yawKick);
+                  p.setRotation(ny, np);
+                  MovePlayerPacket pk = new MovePlayerPacket();
+                  pk.eid = p.getId();
+                  pk.x = (float) p.getX();
+                  pk.y = (float) (p.getY() + p.getEyeHeight());
+                  pk.z = (float) p.getZ();
+                  pk.yaw = ny;
+                  pk.headYaw = ny;
+                  pk.pitch = np;
+                  pk.mode = MovePlayerPacket.MODE_PITCH;
+                  pk.onGround = p.isOnGround();
+                  p.dataPacket(pk);
+              }
+          }
+          JAVA_EOF
+
+          cat > $D/Ballistics.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.block.Block;
+          import cn.nukkit.entity.Entity;
+          import cn.nukkit.entity.EntityLiving;
+          import cn.nukkit.event.entity.EntityDamageByEntityEvent;
+          import cn.nukkit.event.entity.EntityDamageEvent;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.particle.DestroyBlockParticle;
+          import cn.nukkit.math.Vector3;
+
+          import java.util.LinkedHashMap;
+          import java.util.Map;
+
+          /** Hitscan: мгновенный луч, блоки не пропускает. */
+          public final class Ballistics {
+              private Ballistics() {}
+
+              public static void shoot(Guns plugin, Player p, Weapon w, double spreadDeg) {
+                  Level lv = p.getLevel();
+                  double ex = p.getX(), ey = p.getY() + p.getEyeHeight(), ez = p.getZ();
+                  double yaw = p.getYaw(), pitch = p.getPitch();
+                  if (spreadDeg > 0) {
+                      double a = Math.random() * 2 * Math.PI;
+                      double r = spreadDeg * Math.sqrt(Math.random());
+                      yaw += r * Math.cos(a);
+                      pitch += r * Math.sin(a);
+                  }
+                  double yr = Math.toRadians(yaw), pr = Math.toRadians(pitch);
+                  double dx = -Math.sin(yr) * Math.cos(pr);
+                  double dy = -Math.sin(pr);
+                  double dz = Math.cos(yr) * Math.cos(pr);
+
+                  // 1. Ближайший блок на луче
+                  double blockT = w.range;
+                  Block hitBlock = null;
+                  for (double t = 0.4; t <= w.range; t += 0.2) {
+                      Block b = lv.getBlock(new Vector3(Math.floor(ex + dx * t), Math.floor(ey + dy * t), Math.floor(ez + dz * t)));
+                      if (b != null && b.getId() != 0 && !b.canPassThrough()) {
+                          blockT = t;
+                          hitBlock = b;
+                          break;
+                      }
+                  }
+
+                  // 2. Ближайшая живая цель до этого блока
+                  Map<Long, Entity> cands = new LinkedHashMap<>();
+                  for (Player o : lv.getPlayers().values()) cands.put(o.getId(), o);
+                  for (Entity e : lv.getEntities()) cands.put(e.getId(), e);
+
+                  Entity best = null;
+                  double bestT = blockT;
+                  double bestY = 0;
+                  for (Entity e : cands.values()) {
+                      if (e == p || !(e instanceof EntityLiving) || !e.isAlive()) continue;
+                      if (e instanceof Player && ((Player) e).isSpectator()) continue;
+                      double hw = e.getWidth() / 2.0 + 0.1;
+                      double h = e.getHeight();
+                      double t = slab(ex, ey, ez, dx, dy, dz,
+                              e.getX() - hw, e.getY(), e.getZ() - hw,
+                              e.getX() + hw, e.getY() + h, e.getZ() + hw, bestT);
+                      if (t >= 0 && t < bestT) {
+                          best = e;
+                          bestT = t;
+                          bestY = ey + dy * t;
+                      }
+                  }
+
+                  // 3. Урон
+                  if (best != null && plugin.regions().isPvpAllowed(p, best)) {
+                      boolean head = bestY >= best.getY() + best.getHeight() * plugin.headFraction();
+                      double dmg = w.damage * (head ? w.headMult : 1.0);
+                      EntityDamageByEntityEvent ev = new EntityDamageByEntityEvent(
+                              p, best, EntityDamageEvent.DamageCause.ENTITY_ATTACK, (float) dmg, 0f);
+                      // сбрасываем кадры неуязвимости, чтобы быстрые очереди (MP5) наносили урон каждым выстрелом
+                      Reflect.setInt(best, "attackTime", 0);
+                      Reflect.setInt(best, "noDamageTicks", 0);
+                      best.attack(ev);
+                      Fx.sound(p, "random.orb", 0.5f, head ? 1.8f : 1.2f);
+                  }
+
+                  // 4. Эффекты
+                  double endT = (best != null) ? bestT : blockT;
+                  Fx.muzzle(lv, w, yaw, ex, ey, ez, dx, dy, dz);
+                  Fx.trail(lv, w, ex, ey, ez, dx, dy, dz, endT);
+                  if (hitBlock != null && best == null) {
+                      lv.addParticle(new DestroyBlockParticle(
+                              new Vector3(ex + dx * endT, ey + dy * endT, ez + dz * endT), hitBlock));
+                  }
+              }
+
+              /** Пересечение луча с AABB. Возвращает расстояние до входа или -1. */
+              private static double slab(double ox, double oy, double oz, double dx, double dy, double dz,
+                                         double minX, double minY, double minZ,
+                                         double maxX, double maxY, double maxZ, double maxT) {
+                  double tmin = 0, tmax = maxT;
+                  double[] o = {ox, oy, oz}, d = {dx, dy, dz};
+                  double[] mn = {minX, minY, minZ}, mx = {maxX, maxY, maxZ};
+                  for (int i = 0; i < 3; i++) {
+                      if (Math.abs(d[i]) < 1e-9) {
+                          if (o[i] < mn[i] || o[i] > mx[i]) return -1;
+                      } else {
+                          double t1 = (mn[i] - o[i]) / d[i];
+                          double t2 = (mx[i] - o[i]) / d[i];
+                          if (t1 > t2) { double tmp = t1; t1 = t2; t2 = tmp; }
+                          tmin = Math.max(tmin, t1);
+                          tmax = Math.min(tmax, t2);
+                          if (tmin > tmax) return -1;
+                      }
+                  }
+                  return tmin;
+              }
+          }
+          JAVA_EOF
+
+          cat > $D/GunManager.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.inventory.PlayerInventory;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.potion.Effect;
+
+          import java.util.HashMap;
+          import java.util.Map;
+
+          /** Состояние игроков, стрельба, перезарядка, прицел. */
+          public final class GunManager {
+              static final class PlayerState {
+                  long nextShotAt;
+                  long holdUntil;
+                  long lastShotAt;
+                  long lastWarn;
+                  int burst;
+                  long reloadEnd;
+                  int reloadSlot;
+                  String reloadWeapon;
+                  boolean scoped;
+              }
+
+              private final Guns plugin;
+              private final Map<Long, PlayerState> states = new HashMap<>();
+
+              public GunManager(Guns plugin) {
+                  this.plugin = plugin;
+              }
+
+              private PlayerState st(Player p) {
+                  return states.computeIfAbsent(p.getId(), k -> new PlayerState());
+              }
+
+              public void remove(Player p) {
+                  PlayerState s = states.remove(p.getId());
+                  if (s != null && s.scoped) p.removeEffect(Effect.SLOWNESS);
+              }
+
+              private Weapon heldWeapon(Player p) {
+                  String id = GunItems.idOf(p.getInventory().getItemInHand());
+                  return id == null ? null : plugin.registry().weapon(id);
+              }
+
+              // ---------------- правила ----------------
+
+              public boolean canShootHere(Player p) {
+                  String world = p.getLevel().getName();
+                  for (String d : plugin.disabledWorlds()) {
+                      if (d.equalsIgnoreCase(world)) return false;
+                  }
+                  return plugin.regions().isPvpAllowed(p, p);
+              }
+
+              // ---------------- события ----------------
+
+              public void onUse(Player p, Weapon w) {
+                  PlayerState s = st(p);
+                  long now = System.currentTimeMillis();
+                  s.holdUntil = (w.mode == Weapon.Mode.AUTO) ? now + plugin.holdMs() : 0;
+                  tryFire(p, true);
+              }
+
+              public void onSlotChange(Player p, Item newItem) {
+                  PlayerState s = states.get(p.getId());
+                  if (s != null) {
+                      cancelReload(p, s, true);
+                      unscope(p, s);
+                      s.holdUntil = 0;
+                  }
+                  String id = GunItems.idOf(newItem);
+                  Weapon w = id == null ? null : plugin.registry().weapon(id);
+                  if (w != null) hud(p, w, GunItems.mag(newItem, w));
+              }
+
+              public void onDeath(Player p) {
+                  PlayerState s = states.get(p.getId());
+                  if (s != null) {
+                      cancelReload(p, s, false);
+                      unscope(p, s);
+                      s.holdUntil = 0;
+                  }
+              }
+
+              public void onSneak(Player p, boolean sneaking) {
+                  Weapon w = heldWeapon(p);
+                  PlayerState s = st(p);
+                  if (w == null || !w.scope) {
+                      unscope(p, s);
+                      return;
+                  }
+                  if (sneaking && s.reloadEnd == 0) {
+                      s.scoped = true;
+                      applyScope(p, w);
+                  } else {
+                      unscope(p, s);
+                  }
+              }
+
+              // ---------------- стрельба ----------------
+
+              public void tryFire(Player p, boolean click) {
+                  Item hand = p.getInventory().getItemInHand();
+                  String id = GunItems.idOf(hand);
+                  Weapon w = id == null ? null : plugin.registry().weapon(id);
+                  if (w == null || !p.isAlive() || p.isSpectator()) return;
+
+                  PlayerState s = st(p);
+                  long now = System.currentTimeMillis();
+                  if (s.reloadEnd > 0) return;
+                  if (now < s.nextShotAt) return;
+
+                  if (!canShootHere(p)) {
+                      if (now - s.lastWarn > 1500) {
+                          s.lastWarn = now;
+                          p.sendActionBar(plugin.msg("no_fire_zone"));
+                      }
+                      s.nextShotAt = now + 200;
+                      return;
+                  }
+
+                  int mag = GunItems.mag(hand, w);
+                  if (mag <= 0) {
+                      Fx.sound(p, w.soundEmpty, 1f, 1f);
+                      s.nextShotAt = now + 350;
+                      s.holdUntil = 0;
+                      if (click || now - s.lastWarn > 1500) {
+                          s.lastWarn = now;
+                          p.sendActionBar(plugin.msg("empty"));
+                      }
+                      return;
+                  }
+
+                  // разброс растёт в очереди и сбрасывается после паузы
+                  if (now - s.lastShotAt > w.spreadRecoverMs) s.burst = 0;
+                  double spread = Math.min(w.spreadMax, w.spreadBase + w.spreadPerShot * s.burst);
+                  if (s.scoped && w.scope) spread *= w.scopedSpreadMult;
+                  s.burst++;
+                  s.lastShotAt = now;
+
+                  long base = (w.mode == Weapon.Mode.AUTO && now - s.nextShotAt < 50) ? s.nextShotAt : now;
+                  s.nextShotAt = base + w.intervalMs;
+
+                  GunItems.withMag(hand, mag - 1);
+                  p.getInventory().setItemInHand(hand);
+
+                  Fx.sound(p, w.soundShot, 1f, 1f);
+                  Ballistics.shoot(plugin, p, w, spread);
+                  Fx.recoil(p, w.recoilPitch, w.recoilYaw);
+                  hud(p, w, mag - 1);
+              }
+
+              // ---------------- перезарядка ----------------
+
+              public void startReload(Player p) {
+                  Item hand = p.getInventory().getItemInHand();
+                  String id = GunItems.idOf(hand);
+                  Weapon w = id == null ? null : plugin.registry().weapon(id);
+                  if (w == null) return;
+                  PlayerState s = st(p);
+                  if (s.reloadEnd > 0) return;
+                  if (GunItems.mag(hand, w) >= w.magazine) {
+                      p.sendActionBar(plugin.msg("full"));
+                      return;
+                  }
+                  if (countAmmo(p, w.ammoId) <= 0) {
+                      p.sendActionBar(plugin.msg("no_ammo").replace("{ammo}", plugin.registry().ammoName(w.ammoId)));
+                      p.sendMessage(plugin.msg("no_ammo").replace("{ammo}", plugin.registry().ammoName(w.ammoId)));
+                      return;
+                  }
+                  unscope(p, s);
+                  s.holdUntil = 0;
+                  s.reloadEnd = System.currentTimeMillis() + w.reloadMs;
+                  s.reloadSlot = p.getInventory().getHeldItemIndex();
+                  s.reloadWeapon = id;
+                  Fx.sound(p, w.soundReload, 1f, 1f);
+                  p.sendActionBar(plugin.msg("reloading"));
+              }
+
+              private void finishReload(Player p, PlayerState s) {
+                  String wid = s.reloadWeapon;
+                  int slot = s.reloadSlot;
+                  s.reloadEnd = 0;
+                  s.reloadWeapon = null;
+                  PlayerInventory inv = p.getInventory();
+                  Item hand = inv.getItemInHand();
+                  if (wid == null || !wid.equals(GunItems.idOf(hand)) || inv.getHeldItemIndex() != slot) return;
+                  Weapon w = plugin.registry().weapon(wid);
+                  if (w == null) return;
+                  int mag = GunItems.mag(hand, w);
+                  int n = Math.min(w.magazine - mag, countAmmo(p, w.ammoId));
+                  if (n <= 0) return;
+                  takeAmmo(p, w.ammoId, n);
+                  GunItems.withMag(hand, mag + n);
+                  inv.setItemInHand(hand);
+                  hud(p, w, mag + n);
+              }
+
+              private void cancelReload(Player p, PlayerState s, boolean notify) {
+                  if (s.reloadEnd > 0) {
+                      s.reloadEnd = 0;
+                      s.reloadWeapon = null;
+                      if (notify) p.sendActionBar(plugin.msg("reload_cancelled"));
+                  }
+              }
+
+              // ---------------- прицел ----------------
+
+              private void applyScope(Player p, Weapon w) {
+                  Effect e = Effect.getEffect(Effect.SLOWNESS);
+                  e.setDuration(60).setAmplifier(Math.max(0, w.scopeSlowness)).setVisible(false);
+                  p.addEffect(e);
+              }
+
+              private void unscope(Player p, PlayerState s) {
+                  if (s.scoped) {
+                      s.scoped = false;
+                      p.removeEffect(Effect.SLOWNESS);
+                  }
+              }
+
+              // ---------------- тик ----------------
+
+              public void tick(int t) {
+                  if (states.isEmpty()) return;
+                  long now = System.currentTimeMillis();
+                  for (Player p : plugin.getServer().getOnlinePlayers().values()) {
+                      PlayerState s = states.get(p.getId());
+                      if (s == null) continue;
+                      if (s.reloadEnd > 0) {
+                          if (now >= s.reloadEnd) {
+                              finishReload(p, s);
+                          } else if (t % 5 == 0) {
+                              Weapon rw = plugin.registry().weapon(s.reloadWeapon);
+                              if (rw != null) {
+                                  double left = 1.0 - (double) (s.reloadEnd - now) / Math.max(1, rw.reloadMs);
+                                  int filled = (int) Math.round(Math.max(0, Math.min(1, left)) * 10);
+                                  StringBuilder sb = new StringBuilder("§e").append(plugin.msg("reloading")).append(" §8[§a");
+                                  for (int i = 0; i < 10; i++) {
+                                      if (i == filled) sb.append("§7");
+                                      sb.append('|');
+                                  }
+                                  p.sendActionBar(sb.append("§8]").toString());
+                              }
+                          }
+                          continue;
+                      }
+                      Weapon w = heldWeapon(p);
+                      if (w == null) {
+                          if (s.scoped) unscope(p, s);
+                          s.holdUntil = 0;
+                          continue;
+                      }
+                      if (s.scoped && t % 20 == 0) applyScope(p, w);
+                      if (w.mode == Weapon.Mode.AUTO && s.holdUntil > now) tryFire(p, false);
+                  }
+              }
+
+              // ---------------- патроны и HUD ----------------
+
+              public int countAmmo(Player p, String ammoId) {
+                  int n = 0;
+                  PlayerInventory inv = p.getInventory();
+                  for (int i = 0; i < inv.getSize(); i++) {
+                      Item it = inv.getItem(i);
+                      if (ammoId.equals(GunItems.idOf(it))) n += it.getCount();
+                  }
+                  return n;
+              }
+
+              private void takeAmmo(Player p, String ammoId, int amount) {
+                  PlayerInventory inv = p.getInventory();
+                  for (int i = 0; i < inv.getSize() && amount > 0; i++) {
+                      Item it = inv.getItem(i);
+                      if (!ammoId.equals(GunItems.idOf(it))) continue;
+                      int take = Math.min(amount, it.getCount());
+                      amount -= take;
+                      if (take >= it.getCount()) {
+                          inv.clear(i);
+                      } else {
+                          it.setCount(it.getCount() - take);
+                          inv.setItem(i, it);
+                      }
+                  }
+              }
+
+              private void hud(Player p, Weapon w, int mag) {
+                  if (!plugin.hud()) return;
+                  p.sendActionBar("§f" + w.name + " §8| §e" + mag + "§7/§f" + countAmmo(p, w.ammoId));
+              }
+          }
+          JAVA_EOF
+
+          cat > $D/GunListener.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerDeathEvent;
+          import cn.nukkit.event.player.PlayerDropItemEvent;
+          import cn.nukkit.event.player.PlayerInteractEvent;
+          import cn.nukkit.event.player.PlayerItemHeldEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.event.player.PlayerToggleSneakEvent;
+          import cn.nukkit.item.Item;
+
+          public final class GunListener implements Listener {
+              private final Guns plugin;
+              private final GunManager mgr;
+
+              public GunListener(Guns plugin, GunManager mgr) {
+                  this.plugin = plugin;
+                  this.mgr = mgr;
+              }
+
+              @EventHandler
+              public void onInteract(PlayerInteractEvent e) {
+                  PlayerInteractEvent.Action a = e.getAction();
+                  if (a != PlayerInteractEvent.Action.RIGHT_CLICK_AIR && a != PlayerInteractEvent.Action.RIGHT_CLICK_BLOCK) return;
+                  String id = GunItems.idOf(e.getItem());
+                  if (id == null) return;
+                  e.setCancelled(true);
+                  Weapon w = plugin.registry().weapon(id);
+                  if (w != null) mgr.onUse(e.getPlayer(), w);
+              }
+
+              /** Выброс оружия (Q) = перезарядка. Выбросить оружие из другого слота можно как обычно. */
+              @EventHandler
+              public void onDrop(PlayerDropItemEvent e) {
+                  Player p = e.getPlayer();
+                  String dropped = GunItems.idOf(e.getItem());
+                  if (dropped == null || plugin.registry().weapon(dropped) == null) return;
+                  String held = GunItems.idOf(p.getInventory().getItemInHand());
+                  if (!dropped.equals(held)) return;
+                  e.setCancelled(true);
+                  mgr.startReload(p);
+              }
+
+              @EventHandler
+              public void onHeld(PlayerItemHeldEvent e) {
+                  mgr.onSlotChange(e.getPlayer(), e.getItem());
+              }
+
+              @EventHandler
+              public void onSneak(PlayerToggleSneakEvent e) {
+                  mgr.onSneak(e.getPlayer(), e.isSneaking());
+              }
+
+              @EventHandler
+              public void onDeath(PlayerDeathEvent e) {
+                  mgr.onDeath((Player) e.getEntity());
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  mgr.remove(e.getPlayer());
+              }
+          }
+          JAVA_EOF
+
+          cat > $D/ResourcePackInstaller.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import java.io.File;
+          import java.io.InputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.security.MessageDigest;
+          import java.util.Properties;
+
+          /** Разворачивает встроенный ресурс-пак в resource_packs сервера (если нет или изменился). */
+          final class ResourcePackInstaller {
+              private ResourcePackInstaller() {}
+
+              static void install(Guns plugin) {
+                  try (InputStream in = plugin.getResource("guns_pack.zip")) {
+                      if (in == null) {
+                          plugin.getLogger().warning("В jar нет guns_pack.zip, ресурс-пак не развёрнут.");
+                          return;
+                      }
+                      byte[] data = in.readAllBytes();
+                      MessageDigest md = MessageDigest.getInstance("SHA-256");
+                      StringBuilder hex = new StringBuilder();
+                      for (byte b : md.digest(data)) hex.append(String.format("%02x", b));
+                      String hash = hex.toString();
+
+                      String uuid = "?", version = "?";
+                      try (InputStream pi = plugin.getResource("pack.info")) {
+                          if (pi != null) {
+                              Properties pr = new Properties();
+                              pr.load(pi);
+                              uuid = pr.getProperty("uuid", "?");
+                              version = pr.getProperty("version", "?");
+                          }
+                      }
+
+                      File dir = new File(plugin.getServer().getDataPath(), "resource_packs");
+                      dir.mkdirs();
+                      File target = new File(dir, "GunsPack.zip");
+                      plugin.getDataFolder().mkdirs();
+                      File marker = new File(plugin.getDataFolder(), "pack.sha256");
+                      String old = marker.exists() ? new String(Files.readAllBytes(marker.toPath()), StandardCharsets.UTF_8).trim() : "";
+
+                      if (target.exists() && old.equals(hash)) {
+                          plugin.getLogger().info("Ресурс-пак актуален: " + target.getPath() + " (версия " + version + ")");
+                          return;
+                      }
+                      Files.write(target.toPath(), data);
+                      Files.write(marker.toPath(), hash.getBytes(StandardCharsets.UTF_8));
+                      plugin.getLogger().info("Ресурс-пак развёрнут: " + target.getPath() + " (версия " + version + ")");
+                      plugin.getLogger().warning("ПРОПИШИТЕ пак в resource_packs.yml (uuid " + uuid + ", версия " + version
+                              + ") и ПЕРЕЗАПУСТИТЕ сервер: паки читаются при старте.");
+                  } catch (Exception e) {
+                      plugin.getLogger().error("Не удалось развернуть ресурс-пак: " + e);
+                  }
+              }
+          }
+          JAVA_EOF
+
+          cat > $D/Guns.java <<'JAVA_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.Task;
+
+          import java.util.*;
+
+          public final class Guns extends PluginBase {
+              private static final Map<String, String> DEF = new HashMap<>();
+              static {
+                  DEF.put("no_ammo", "§cНет патронов: {ammo}");
+                  DEF.put("reloading", "§eПерезарядка...");
+                  DEF.put("reloaded", "§aПерезаряжено");
+                  DEF.put("reload_cancelled", "§cПерезарядка отменена");
+                  DEF.put("empty", "§cМагазин пуст. Выбросьте оружие (Q) для перезарядки");
+                  DEF.put("full", "§7Магазин полон");
+                  DEF.put("no_fire_zone", "§cЗдесь стрелять нельзя");
+                  DEF.put("no_perm", "§cНет прав");
+                  DEF.put("no_player", "§cИгрок {player} не найден");
+                  DEF.put("unknown_item", "§cНеизвестный предмет: {id}");
+                  DEF.put("bad_count", "§cКоличество должно быть от 1 до 576");
+                  DEF.put("usage", "§cИспользование: /gun give <ник> <оружие|патроны> [количество] | /gun reload");
+                  DEF.put("given", "§aВыдано {player}: {id} x{count}");
+                  DEF.put("reloaded_cfg", "§aКонфиги Guns перезагружены");
+              }
+
+              private static Guns instance;
+              private WeaponRegistry registry;
+              private GunManager manager;
+              private RegionAdapter regions;
+
+              private List<String> disabledWorlds = new ArrayList<>();
+              private double headFraction = 0.8;
+              private long holdMs = 300;
+              private boolean hud = true;
+              private boolean giveReserve = false;
+
+              public static Guns get() { return instance; }
+              public WeaponRegistry registry() { return registry; }
+              public RegionAdapter regions() { return regions; }
+              public List<String> disabledWorlds() { return disabledWorlds; }
+              public double headFraction() { return headFraction; }
+              public long holdMs() { return holdMs; }
+              public boolean hud() { return hud; }
+
+              public String msg(String key) {
+                  return getConfig().getString("messages." + key, DEF.getOrDefault(key, key));
+              }
+
+              @Override
+              public void onLoad() {
+                  instance = this;
+                  saveDefaultConfig();
+                  saveResource("weapons.yml", false);
+                  readSettings();
+                  registry = new WeaponRegistry(this);
+                  registry.load();
+                  regions = new RegionAdapter(this);
+                  // Кастомные предметы нужно регистрировать до того, как на сервер зайдут игроки
+                  CustomItems.register(this);
+              }
+
+              @Override
+              public void onEnable() {
+                  ResourcePackInstaller.install(this);
+                  manager = new GunManager(this);
+                  getServer().getPluginManager().registerEvents(new GunListener(this, manager), this);
+                  getServer().getScheduler().scheduleRepeatingTask(this, new Task() {
+                      @Override
+                      public void onRun(int currentTick) {
+                          manager.tick(currentTick);
+                      }
+                  }, 1);
+                  getLogger().info("Guns включён. Оружия: " + registry.weapons().size()
+                          + ", кастомные предметы: " + (CustomItems.available ? "да" : "НЕТ (запасные ванильные)"));
+              }
+
+              private void readSettings() {
+                  disabledWorlds = new ArrayList<>(getConfig().getStringList("disabled_worlds"));
+                  headFraction = Math.max(0.5, Math.min(0.99, getConfig().getDouble("headshot_fraction", 0.8)));
+                  holdMs = Math.max(100, getConfig().getInt("auto_hold_timeout_ms", 300));
+                  hud = getConfig().getBoolean("hud", true);
+                  giveReserve = getConfig().getBoolean("give_reserve_with_weapon", false);
+              }
+
+              @Override
+              public boolean onCommand(CommandSender s, Command c, String label, String[] a) {
+                  if (!c.getName().equalsIgnoreCase("gun")) return false;
+                  if (!s.hasPermission("gun.admin")) {
+                      s.sendMessage(msg("no_perm"));
+                      return true;
+                  }
+                  if (a.length == 0) {
+                      s.sendMessage(msg("usage"));
+                      return true;
+                  }
+                  if (a[0].equalsIgnoreCase("reload")) {
+                      reloadConfig();
+                      readSettings();
+                      registry.load();
+                      s.sendMessage(msg("reloaded_cfg"));
+                      return true;
+                  }
+                  if (a[0].equalsIgnoreCase("give")) {
+                      give(s, a);
+                      return true;
+                  }
+                  s.sendMessage(msg("usage"));
+                  return true;
+              }
+
+              private void give(CommandSender s, String[] a) {
+                  if (a.length < 3) {
+                      s.sendMessage(msg("usage"));
+                      return;
+                  }
+                  Player t = getServer().getPlayerExact(a[1]);
+                  if (t == null) t = getServer().getPlayer(a[1]);
+                  if (t == null) {
+                      s.sendMessage(msg("no_player").replace("{player}", a[1]));
+                      return;
+                  }
+                  String id = a[2].toLowerCase(Locale.ROOT);
+                  if (!id.contains(":")) id = "eclips:" + id;
+                  int count = 1;
+                  if (a.length >= 4) {
+                      try {
+                          count = Integer.parseInt(a[3]);
+                      } catch (NumberFormatException ex) {
+                          s.sendMessage(msg("bad_count"));
+                          return;
+                      }
+                  }
+                  if (count < 1 || count > 576) {
+                      s.sendMessage(msg("bad_count"));
+                      return;
+                  }
+                  Weapon w = registry.weapon(id);
+                  if (w != null) {
+                      int n = Math.min(count, 36);
+                      for (int i = 0; i < n; i++) giveItem(t, GunItems.weapon(w));
+                      if (giveReserve && w.reserve > 0) giveAmmo(t, w.ammoId, w.reserve);
+                      count = n;
+                  } else if (registry.isAmmo(id)) {
+                      giveAmmo(t, id, count);
+                  } else {
+                      s.sendMessage(msg("unknown_item").replace("{id}", id));
+                      return;
+                  }
+                  s.sendMessage(msg("given").replace("{player}", t.getName()).replace("{id}", id).replace("{count}", String.valueOf(count)));
+              }
+
+              private void giveAmmo(Player t, String ammoId, int count) {
+                  String name = registry.ammoName(ammoId);
+                  while (count > 0) {
+                      int n = Math.min(64, count);
+                      giveItem(t, GunItems.ammo(ammoId, n, name));
+                      count -= n;
+                  }
+              }
+
+              private void giveItem(Player t, Item item) {
+                  Item[] left = t.getInventory().addItem(item);
+                  for (Item l : left) t.getLevel().dropItem(t, l);
+              }
+          }
+          JAVA_EOF
+
+      # ------------------------------------------------------------------
+      # 3. Кастомные предметы: шаблон + заглушка (подбор варианта при сборке)
+      # ------------------------------------------------------------------
+      - name: Write custom item templates
+        run: |
+          set -e
+
+          # Реальная регистрация через Nukkit-MOT. Плейсхолдеры @CATIMPORT@ / @CATENUM@ и строки //GROUP
+          # подставляются/удаляются на шаге сборки, если какой-то вариант API не подошёл.
+          cat > staging/CustomItems.tpl <<'TPL_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.item.Item;
+          import cn.nukkit.item.customitem.CustomItemDefinition;
+          import cn.nukkit.item.customitem.ItemCustom;
+          import @CATIMPORT@;
+          import cn.nukkit.plugin.PluginBase;
+
+          import java.lang.reflect.InvocationTargetException;
+          import java.lang.reflect.Method;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.List;
+
+          public final class CustomItems {
+              public static boolean available = false;
+
+              private CustomItems() {}
+
+              private static CustomItemDefinition def(ItemCustom item, String tex) {
+                  return CustomItemDefinition.simpleBuilder(item, @CATENUM@.EQUIPMENT)
+                          .texture(tex)
+                          .creativeGroup("itemGroup.name.guns") //GROUP
+                          .build();
+              }
+
+              public abstract static class Gun extends ItemCustom implements GunMarker {
+                  private final String gid;
+                  protected Gun(String id, String name, String tex) { super(id, name, tex); this.gid = id; }
+                  @Override public int getMaxStackSize() { return 1; }
+                  @Override public String gunId() { return gid; }
+              }
+
+              public abstract static class Ammo extends ItemCustom implements GunMarker {
+                  private final String gid;
+                  protected Ammo(String id, String name, String tex) { super(id, name, tex); this.gid = id; }
+                  @Override public int getMaxStackSize() { return 64; }
+                  @Override public String gunId() { return gid; }
+              }
+
+              public static class Glock17 extends Gun {
+                  public Glock17() { super("eclips:glock_17", "Glock 17", "glock_17"); }
+                  @Override public CustomItemDefinition getDefinition() { return def(this, "glock_17"); }
+              }
+              public static class Mp5 extends Gun {
+                  public Mp5() { super("eclips:mp5", "MP5", "mp5"); }
+                  @Override public CustomItemDefinition getDefinition() { return def(this, "mp5"); }
+              }
+              public static class Ak47 extends Gun {
+                  public Ak47() { super("eclips:ak_47", "AK-47", "ak_47"); }
+                  @Override public CustomItemDefinition getDefinition() { return def(this, "ak_47"); }
+              }
+              public static class Awm extends Gun {
+                  public Awm() { super("eclips:awm", "AWM", "awm"); }
+                  @Override public CustomItemDefinition getDefinition() { return def(this, "awm"); }
+              }
+              public static class Ammo9x19 extends Ammo {
+                  public Ammo9x19() { super("eclips:ammo_9x19", "9x19mm Ammo", "ammo_9x19"); }
+                  @Override public CustomItemDefinition getDefinition() { return def(this, "ammo_9x19"); }
+              }
+              public static class Ammo762x39 extends Ammo {
+                  public Ammo762x39() { super("eclips:ammo_762x39", "7.62x39mm Ammo", "ammo_762x39"); }
+                  @Override public CustomItemDefinition getDefinition() { return def(this, "ammo_762x39"); }
+              }
+              public static class Ammo338 extends Ammo {
+                  public Ammo338() { super("eclips:ammo_338_lapua", ".338 Lapua Magnum Ammo", "ammo_338_lapua"); }
+                  @Override public CustomItemDefinition getDefinition() { return def(this, "ammo_338_lapua"); }
+              }
+
+              /** Порядок важен: он же порядок в креативной группе (иконка группы = Glock 17). */
+              public static void register(PluginBase plugin) {
+                  List<Class<?>> classes = Arrays.asList(Glock17.class, Mp5.class, Ak47.class, Awm.class,
+                          Ammo9x19.class, Ammo762x39.class, Ammo338.class);
+                  int ok = 0;
+                  for (Class<?> c : classes) {
+                      if (callRegister(plugin, c)) ok++;
+                      else plugin.getLogger().error("Не удалось зарегистрировать кастомный предмет " + c.getSimpleName());
+                  }
+                  available = ok == classes.size();
+              }
+
+              /** Item.registerCustomItem вызывается через рефлексию: сигнатура (Class или List) зависит от сборки ядра. */
+              private static boolean callRegister(PluginBase plugin, Class<?> c) {
+                  for (Method m : Item.class.getMethods()) {
+                      if (!m.getName().equals("registerCustomItem") || m.getParameterCount() != 1) continue;
+                      Class<?> pt = m.getParameterTypes()[0];
+                      Object arg;
+                      if (pt.isAssignableFrom(Class.class)) arg = c;
+                      else if (pt.isAssignableFrom(ArrayList.class)) arg = new ArrayList<Object>(Arrays.asList(c));
+                      else continue;
+                      try {
+                          Object r = m.invoke(null, arg);
+                          if (r != null && r.getClass().getSimpleName().equalsIgnoreCase("Error")) {
+                              plugin.getLogger().error("registerCustomItem вернул ошибку: " + r);
+                              return false;
+                          }
+                          return true;
+                      } catch (InvocationTargetException e) {
+                          plugin.getLogger().error("registerCustomItem: " + e.getCause());
+                          return false;
+                      } catch (Exception e) {
+                          plugin.getLogger().error("registerCustomItem: " + e);
+                          return false;
+                      }
+                  }
+                  plugin.getLogger().error("Item.registerCustomItem(...) не найден в этом ядре");
+                  return false;
+              }
+
+              /** Возвращает наш кастомный предмет или null (тогда GunItems берёт запасной ванильный). */
+              public static Item create(String id) {
+                  if (!available) return null;
+                  switch (id) {
+                      case "eclips:glock_17": return new Glock17();
+                      case "eclips:mp5": return new Mp5();
+                      case "eclips:ak_47": return new Ak47();
+                      case "eclips:awm": return new Awm();
+                      case "eclips:ammo_9x19": return new Ammo9x19();
+                      case "eclips:ammo_762x39": return new Ammo762x39();
+                      case "eclips:ammo_338_lapua": return new Ammo338();
+                      default: return null;
+                  }
+              }
+          }
+          TPL_EOF
+
+          # Заглушка: компилируется всегда, кастомные предметы заменяются ванильными с NBT
+          cat > staging/CustomItems.stub <<'STUB_EOF'
+          package ru.eclips.guns;
+
+          import cn.nukkit.item.Item;
+          import cn.nukkit.plugin.PluginBase;
+
+          public final class CustomItems {
+              public static boolean available = false;
+
+              private CustomItems() {}
+
+              public static void register(PluginBase plugin) {
+                  plugin.getLogger().warning("Кастомные предметы отключены: сборка выполнена с заглушкой (API ядра не подошёл). Используются ванильные предметы с NBT.");
+              }
+
+              public static Item create(String id) {
+                  return null;
+              }
+          }
+          STUB_EOF
+
+      # ------------------------------------------------------------------
+      # 4. Ресурс-пак (геометрия, текстуры, attachable, звуки, lang) -> guns_pack.zip внутри jar
+      # ------------------------------------------------------------------
+      - name: Generate resource pack
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          HOLD_PRESET: ${{ github.event.inputs.hold_preset || '1' }}
+        run: |
+          set -e
+          cat > staging/gen_pack.py <<'PY_EOF'
+          import json, os, math, random, struct, zlib, wave, zipfile
+
+          RUN = os.environ.get("RUN_NUMBER", "1")
+          PACK_UUID = "5d1c7a3e-2b64-4f0a-9e8d-71a3c4b2f6e1"
+          MODULE_UUID = "c8e2f4a6-9b13-4d57-a0c1-3f6e8d2b5a74"
+          VERSION = [1, 0, int(RUN)]
+          OUT = "pack"
+
+          # ===================================================================
+          # ПОЛОЖЕНИЕ В РУКЕ.
+          # Пресет выбирается при запуске workflow (вход hold_preset, 1-4) или переменной HOLD_PRESET.
+          #   rot - поворот [x, y, z] в градусах: first = первое лицо, third = третье лицо.
+          # Для каждого оружия:
+          #   GRIP  - центр рукояти в координатах модели; он совмещается с точкой руки (учитывает поворот и размер)
+          #   SCALE - размер в руке
+          #   EXTRA - ручная добавка к позиции для финальной подгонки: first / third = [x, y, z]
+          # Ничего из этого в игре не проверено. Если оружие смотрит не туда, пересоберите с другим пресетом;
+          # если направление верное, но смещено или велико, правьте EXTRA и SCALE.
+          # ===================================================================
+          PRESETS = {
+              "1": {"third": [0, 0, 0],   "first": [-90, 0, 0]},   # ствол вперёд; от первого лица ствол вдоль предплечья
+              "2": {"third": [0, 0, 0],   "first": [0, 0, 0]},     # везде без поворота
+              "3": {"third": [-90, 0, 0], "first": [-90, 0, 0]},   # ствол вдоль предплечья в обоих видах
+              "4": {"third": [0, -90, 0], "first": [0, -90, 0]},   # ствол вбок (по оси X руки)
+          }
+          GRIP = {"glock_17": (0, -4, 0), "mp5": (0, -4, -2), "ak_47": (0, -4, 0), "awm": (0, -5, 3)}
+          SCALE = {"glock_17": 1.2, "mp5": 0.8, "ak_47": 0.7, "awm": 0.6}
+          EXTRA = {wid: {"first": [0, 0, 0], "third": [0, 0, 0]} for wid in GRIP}
+
+          def _rot(v, r):
+              x, y, z = v
+              a = math.radians(r[0])
+              y, z = y * math.cos(a) - z * math.sin(a), y * math.sin(a) + z * math.cos(a)
+              b = math.radians(r[1])
+              x, z = x * math.cos(b) + z * math.sin(b), -x * math.sin(b) + z * math.cos(b)
+              return [x, y, z]
+
+          def _hold():
+              preset = PRESETS.get(os.environ.get("HOLD_PRESET", "1"), PRESETS["1"])
+              res = {}
+              for wid in GRIP:
+                  s = SCALE[wid]
+                  res[wid] = {}
+                  for view in ("first", "third"):
+                      rot = preset[view]
+                      g = _rot(GRIP[wid], rot)
+                      pos = [round(-s * g[i] + EXTRA[wid][view][i], 2) for i in range(3)]
+                      res[wid][view] = {"pos": pos, "rot": rot, "scale": s}
+              return res
+
+          HOLD = _hold()
+
+          PALETTE = {
+              "slide": (58, 60, 66), "frame": (34, 34, 38), "grip": (44, 40, 38), "metal": (128, 130, 138),
+              "dark": (20, 20, 24), "wood": (139, 90, 48), "woodd": (100, 64, 34), "olive": (78, 88, 62),
+              "scope": (26, 28, 36), "lens": (90, 160, 210), "brass": (214, 172, 64), "steel": (92, 96, 104),
+              "copper": (184, 102, 56),
+          }
+          ORDER = list(PALETTE)
+
+          def C(o, s, col, pivot=None, rot=None):
+              return {"o": o, "s": s, "col": col, "pivot": pivot, "rot": rot}
+
+          # Ствол направлен в -Z, верх +Y. Единицы = 1/16 блока.
+          WEAPONS = {
+              "glock_17": [
+                  C([-1, -1, -9], [2, 1, 9], "frame"),
+                  C([-1, 0, -11], [2, 3, 12], "slide"),
+                  C([-0.5, 0.5, -12], [1, 1, 1], "metal"),
+                  C([-0.25, 3, -11], [0.5, 1, 1], "dark"),
+                  C([-0.25, 3, -1.5], [0.5, 1, 1], "dark"),
+                  C([-0.5, -2, -6], [1, 1, 4], "frame"),
+                  C([-1, -7, -1], [2, 6, 3], "grip", [0, -1, -1], [-12, 0, 0]),
+                  C([-0.5, -1.5, -4], [1, 1.5, 0.5], "dark"),
+              ],
+              "mp5": [
+                  C([-1.5, -1, -13], [3, 4, 16], "slide"),
+                  C([-1.25, 0, -22], [2.5, 2.5, 9], "frame"),
+                  C([-0.5, 0.5, -24], [1, 1, 2], "metal"),
+                  C([-0.3, 2.5, -21], [0.6, 1.5, 0.6], "dark"),
+                  C([-1.5, -1.5, -20], [3, 1.5, 7], "grip"),
+                  C([-1, -9, -9], [2, 8, 3], "frame", [0, -1, -9], [10, 0, 0]),
+                  C([-1, -7, -3], [2, 6, 2.5], "grip", [0, -1, -3], [-15, 0, 0]),
+                  C([-1, -1, 3], [2, 3, 9], "frame"),
+                  C([-1.2, -2, 12], [2.4, 5, 1.5], "grip"),
+                  C([-0.5, 3, -4], [1, 1, 1.5], "dark"),
+                  C([-2.2, 2, -8], [1, 1, 1.5], "metal"),
+              ],
+              "ak_47": [
+                  C([-1.5, -1, -8], [3, 4, 12], "steel"),
+                  C([-1.25, 3, -8], [2.5, 1, 12], "slide"),
+                  C([-0.6, 1, -26], [1.2, 1.2, 19], "metal"),
+                  C([-0.7, 2.2, -22], [1.4, 1, 14], "steel"),
+                  C([-1.5, -0.5, -20], [3, 2.5, 8], "wood"),
+                  C([-0.3, 3, -24], [0.6, 2, 0.6], "dark"),
+                  C([-0.9, 0.8, -28], [1.8, 1.6, 2.5], "dark"),
+                  C([-1, -8, -9], [2, 8, 3], "slide", [0, -1, -9], [8, 0, 0]),
+                  C([-1, -13, -9.5], [2, 6, 3], "slide", [0, -8, -9], [22, 0, 0]),
+                  C([-1, -7, -1], [2, 6, 2.5], "woodd", [0, -1, -1], [-18, 0, 0]),
+                  C([-1, -1.5, 4], [2, 3.5, 12], "wood"),
+                  C([-1, -3, 16], [2, 6, 1.5], "woodd"),
+                  C([-0.5, 3, -6], [1, 1, 1], "dark"),
+              ],
+              "awm": [
+                  C([-1.5, -1, -10], [3, 3.5, 14], "olive"),
+                  C([-0.8, 0, -38], [1.6, 1.6, 29], "metal"),
+                  C([-1.2, -0.2, -41], [2.4, 2, 4], "dark"),
+                  C([-1, 3, -8], [2, 2, 12], "scope"),
+                  C([-1.4, 2.8, -10], [2.8, 2.8, 2], "scope"),
+                  C([-1.2, 2.8, 4], [2.4, 2.4, 1.5], "scope"),
+                  C([-0.7, 3, -10.2], [1.4, 1.4, 0.3], "lens"),
+                  C([-0.5, 2, -6], [1, 1.2, 1], "dark"),
+                  C([-0.5, 2, -1], [1, 1.2, 1], "dark"),
+                  C([1.5, 0.5, -3], [1.5, 0.8, 0.8], "metal"),
+                  C([3, 0.2, -3.2], [1.2, 1.2, 1.2], "metal"),
+                  C([-1, -4, -6], [2, 3, 4], "dark"),
+                  C([-1.2, -2.5, 4], [2.4, 4.5, 16], "olive"),
+                  C([-1.2, -3, 20], [2.4, 6, 1.5], "dark"),
+                  C([-1, -8, 2], [2, 6, 2.5], "olive", [0, -2, 2], [-15, 0, 0]),
+                  C([-1.5, -3, -24], [0.6, 3, 0.6], "dark"),
+                  C([0.9, -3, -24], [0.6, 3, 0.6], "dark"),
+              ],
+          }
+
+          NAMES = {
+              "glock_17": ("Glock 17", "Glock 17"),
+              "mp5": ("MP5", "MP5"),
+              "ak_47": ("AK-47", "AK-47"),
+              "awm": ("AWM", "AWM"),
+              "ammo_9x19": ("9x19mm Ammo", "Патроны 9x19 мм"),
+              "ammo_762x39": ("7.62x39mm Ammo", "Патроны 7.62x39 мм"),
+              "ammo_338_lapua": (".338 Lapua Magnum Ammo", "Патроны .338 Lapua Magnum"),
+          }
+
+          def w(path, data):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              mode = "wb" if isinstance(data, bytes) else "w"
+              with open(path, mode, **({} if mode == "wb" else {"encoding": "utf-8"})) as f:
+                  f.write(data)
+
+          def wjson(path, obj):
+              w(path, json.dumps(obj, indent=2, ensure_ascii=False))
+
+          def write_png(path, width, height, rows):
+              raw = b"".join(b"\x00" + bytes([v for px in row for v in px]) for row in rows)
+              def chunk(t, d):
+                  return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+              data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+                      + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+              w(path, data)
+
+          # ---------------- геометрия / attachable / анимации ----------------
+          def geometry(wid, cubes):
+              out = []
+              for c in cubes:
+                  i = ORDER.index(c["col"])
+                  face = {"uv": [i, 0], "uv_size": [1, 1]}
+                  cube = {"origin": c["o"], "size": c["s"],
+                          "uv": {k: dict(face) for k in ("north", "east", "south", "west", "up", "down")}}
+                  if c["rot"]:
+                      cube["pivot"] = c["pivot"]
+                      cube["rotation"] = c["rot"]
+                  out.append(cube)
+              return {"format_version": "1.12.0", "minecraft:geometry": [{
+                  "description": {"identifier": "geometry.eclips_" + wid, "texture_width": 16, "texture_height": 16,
+                                  "visible_bounds_width": 6, "visible_bounds_height": 6, "visible_bounds_offset": [0, 0, 0]},
+                  "bones": [{"name": "gun", "pivot": [0, 0, 0], "cubes": out}]}]}
+
+          def attachable(wid):
+              return {"format_version": "1.10.0", "minecraft:attachable": {"description": {
+                  "identifier": "eclips:" + wid,
+                  "materials": {"default": "entity_alpha", "enchanted": "entity_alpha_glint"},
+                  "textures": {"default": "textures/attachables/" + wid, "enchanted": "textures/misc/enchanted_item_glint"},
+                  "geometry": {"default": "geometry.eclips_" + wid},
+                  "animations": {"hold_first_person": "animation.eclips.%s.hold_first_person" % wid,
+                                 "hold_third_person": "animation.eclips.%s.hold_third_person" % wid},
+                  "scripts": {"animate": [{"hold_first_person": "context.is_first_person == 1.0"},
+                                          {"hold_third_person": "context.is_first_person == 0.0"}]},
+                  "render_controllers": ["controller.render.item_default"]}}}
+
+          def animations(wid):
+              h = HOLD[wid]
+              def anim(v):
+                  s = v["scale"]
+                  return {"loop": True, "bones": {"gun": {"position": v["pos"], "rotation": v["rot"], "scale": [s, s, s]}}}
+              return {"format_version": "1.8.0", "animations": {
+                  "animation.eclips.%s.hold_first_person" % wid: anim(h["first"]),
+                  "animation.eclips.%s.hold_third_person" % wid: anim(h["third"])}}
+
+          # ---------------- текстуры ----------------
+          def palette_texture(path):
+              rnd = random.Random(7)
+              rows = []
+              for y in range(16):
+                  row = []
+                  for x in range(16):
+                      if x < len(ORDER):
+                          r, g, b = PALETTE[ORDER[x]]
+                          n = 0 if y == 0 else rnd.randint(-4, 4)
+                          row.append((max(0, min(255, r + n)), max(0, min(255, g + n)), max(0, min(255, b + n)), 255))
+                      else:
+                          row.append((255, 0, 255, 255))
+                  rows.append(row)
+              write_png(path, 16, 16, rows)
+
+          def project(c):
+              ox, oy, oz = c["o"]
+              sx, sy, sz = c["s"]
+              pts = [(oy, oz), (oy + sy, oz), (oy + sy, oz + sz), (oy, oz + sz)]
+              if c["rot"]:
+                  a = math.radians(c["rot"][0])
+                  py, pz = c["pivot"][1], c["pivot"][2]
+                  npts = []
+                  for (y, z) in pts:
+                      dy, dz = y - py, z - pz
+                      npts.append((py + dy * math.cos(a) - dz * math.sin(a), pz + dy * math.sin(a) + dz * math.cos(a)))
+                  pts = npts
+              return [(-z, -y) for (y, z) in pts]
+
+          def inside(poly, px, py):
+              pos = neg = False
+              n = len(poly)
+              for i in range(n):
+                  x1, y1 = poly[i]
+                  x2, y2 = poly[(i + 1) % n]
+                  cr = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+                  if cr > 0: pos = True
+                  if cr < 0: neg = True
+              return not (pos and neg)
+
+          def outline(grid, size):
+              res = [row[:] for row in grid]
+              for y in range(size):
+                  for x in range(size):
+                      if grid[y][x] is None:
+                          for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                              nx, ny = x + dx, y + dy
+                              if 0 <= nx < size and 0 <= ny < size and grid[ny][nx] is not None:
+                                  res[y][x] = (10, 10, 12)
+                                  break
+              return res
+
+          def grid_to_rows(grid, size):
+              return [[(g[0], g[1], g[2], 255) if g else (0, 0, 0, 0) for g in row] for row in grid]
+
+          def render_icon(cubes, size=32):
+              polys = [(project(c), c["col"]) for c in cubes]
+              us = [p[0] for poly, _ in polys for p in poly]
+              vs = [p[1] for poly, _ in polys for p in poly]
+              umin, umax, vmin, vmax = min(us), max(us), min(vs), max(vs)
+              scale = min(28.0 / (umax - umin), 28.0 / (vmax - vmin))
+              ou = (size - (umax - umin) * scale) / 2
+              ov = (size - (vmax - vmin) * scale) / 2
+              grid = [[None] * size for _ in range(size)]
+              for poly, col in polys:
+                  pp = [((u - umin) * scale + ou, (v - vmin) * scale + ov) for u, v in poly]
+                  for y in range(size):
+                      for x in range(size):
+                          if inside(pp, x + 0.5, y + 0.5):
+                              grid[y][x] = PALETTE[col]
+              return grid_to_rows(outline(grid, size), size)
+
+          def rect(grid, x, y, wd, ht, col):
+              for yy in range(y, y + ht):
+                  for xx in range(x, x + wd):
+                      if 0 <= xx < 32 and 0 <= yy < 32:
+                          grid[yy][xx] = col
+
+          def render_ammo(kind):
+              grid = [[None] * 32 for _ in range(32)]
+              if kind == "ammo_9x19":
+                  n, sp, cw, ch, bw, bh, bcol = 3, 8, 6, 9, 5, 4, "copper"
+              elif kind == "ammo_762x39":
+                  n, sp, cw, ch, bw, bh, bcol = 3, 9, 7, 12, 6, 6, "steel"
+              else:
+                  n, sp, cw, ch, bw, bh, bcol = 2, 11, 9, 14, 5, 8, "copper"
+              total = (n - 1) * sp + cw
+              x0 = (32 - total) // 2
+              base = 28
+              for i in range(n):
+                  cx = x0 + i * sp
+                  rect(grid, cx, base - ch, cw, ch, PALETTE["brass"])
+                  rect(grid, cx + 1, base - ch, 1, ch, (240, 205, 110))
+                  rect(grid, cx - 1, base - 1, cw + 2, 1, PALETTE["brass"])
+                  bx = cx + (cw - bw) // 2
+                  rect(grid, bx, base - ch - bh, bw, bh, PALETTE[bcol])
+                  rect(grid, bx, base - ch - bh, bw, 1, (60, 40, 30))
+              return grid_to_rows(outline(grid, 32), 32)
+
+          # ---------------- звуки (синтез) ----------------
+          SR = 22050
+
+          def wav(path, samples):
+              peak = max(1e-6, max(abs(s) for s in samples))
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with wave.open(path, "wb") as f:
+                  f.setnchannels(1)
+                  f.setsampwidth(2)
+                  f.setframerate(SR)
+                  f.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, s / peak * 0.9)) * 32767)) for s in samples))
+
+          def shot(dur, decay, hz, tdecay, noise, lp, thump, echo=None, seed=1):
+              rnd = random.Random(seed)
+              n = int(SR * dur)
+              out = [0.0] * n
+              y = 0.0
+              for i in range(n):
+                  t = i / SR
+                  y += lp * (rnd.uniform(-1, 1) - y)
+                  s = noise * y * math.exp(-decay * t)
+                  s += thump * math.sin(2 * math.pi * hz * (1 - 0.5 * min(1.0, t * 8)) * t) * math.exp(-tdecay * t)
+                  out[i] = s
+              if echo:
+                  d = int(SR * echo[0])
+                  res = out[:]
+                  for i in range(d, n):
+                      res[i] += echo[1] * out[i - d]
+                  out = res
+              return out
+
+          def clicks(total, events, seed=3):
+              rnd = random.Random(seed)
+              n = int(SR * total)
+              out = [0.0] * n
+              for (t0, hz, amp) in events:
+                  start = int(t0 * SR)
+                  length = int(0.05 * SR)
+                  for i in range(length):
+                      if start + i >= n: break
+                      t = i / SR
+                      out[start + i] += amp * (0.6 * rnd.uniform(-1, 1) + 0.4 * math.sin(2 * math.pi * hz * t)) * math.exp(-90 * t)
+              return out
+
+          SOUNDS = {
+              "glock_17": dict(shot=shot(0.25, 30, 150, 22, 1.0, 0.55, 0.8, seed=11),
+                               reload=clicks(1.5, [(0.2, 900, 0.7), (0.85, 600, 1.0), (1.25, 1400, 0.8)], 5)),
+              "mp5": dict(shot=shot(0.22, 34, 130, 24, 1.0, 0.6, 0.7, seed=12),
+                          reload=clicks(2.0, [(0.3, 800, 0.7), (1.2, 550, 1.0), (1.7, 1300, 0.8)], 6)),
+              "ak_47": dict(shot=shot(0.45, 16, 95, 14, 1.0, 0.35, 1.0, echo=(0.07, 0.3), seed=13),
+                            reload=clicks(2.5, [(0.4, 700, 0.8), (1.5, 500, 1.0), (2.1, 1100, 0.9)], 7)),
+              "awm": dict(shot=shot(1.2, 7, 55, 5, 1.0, 0.25, 1.3, echo=(0.18, 0.35), seed=14),
+                          reload=clicks(3.5, [(0.5, 600, 0.8), (1.2, 1200, 0.9), (2.2, 500, 1.0), (3.0, 900, 0.9)], 8)),
+          }
+
+          def main():
+              for d in ("textures/attachables", "textures/items", "models/entity", "attachables", "animations",
+                        "sounds/guns", "texts"):
+                  os.makedirs(os.path.join(OUT, d), exist_ok=True)
+
+              wjson(OUT + "/manifest.json", {
+                  "format_version": 2,
+                  "header": {"name": "Guns", "description": "Guns resource pack (models, textures, sounds)",
+                             "uuid": PACK_UUID, "version": VERSION, "min_engine_version": [1, 21, 0]},
+                  "modules": [{"type": "resources", "uuid": MODULE_UUID, "version": VERSION}]})
+
+              palette_texture(OUT + "/textures/palette.png")
+              item_tex = {}
+              for wid, cubes in WEAPONS.items():
+                  wjson("%s/models/entity/%s.geo.json" % (OUT, wid), geometry(wid, cubes))
+                  wjson("%s/attachables/%s.json" % (OUT, wid), attachable(wid))
+                  wjson("%s/animations/%s.animation.json" % (OUT, wid), animations(wid))
+                  palette_texture("%s/textures/attachables/%s.png" % (OUT, wid))
+                  write_png("%s/textures/items/%s.png" % (OUT, wid), 32, 32, render_icon(cubes))
+                  item_tex[wid] = {"textures": "textures/items/" + wid}
+              for aid in ("ammo_9x19", "ammo_762x39", "ammo_338_lapua"):
+                  write_png("%s/textures/items/%s.png" % (OUT, aid), 32, 32, render_ammo(aid))
+                  item_tex[aid] = {"textures": "textures/items/" + aid}
+              wjson(OUT + "/textures/item_texture.json", {
+                  "resource_pack_name": "guns", "texture_name": "atlas.items", "texture_data": item_tex})
+              write_png(OUT + "/pack_icon.png", 32, 32, render_icon(WEAPONS["glock_17"]))
+
+              defs = {}
+              for wid, snd in SOUNDS.items():
+                  wav("%s/sounds/guns/%s_shot.wav" % (OUT, wid), snd["shot"])
+                  wav("%s/sounds/guns/%s_reload.wav" % (OUT, wid), snd["reload"])
+                  defs["eclips.%s.shot" % wid] = {"category": "neutral", "max_distance": 64,
+                                                  "sounds": [{"name": "sounds/guns/%s_shot" % wid, "volume": 1.0}]}
+                  defs["eclips.%s.reload" % wid] = {"category": "neutral", "max_distance": 24,
+                                                    "sounds": [{"name": "sounds/guns/%s_reload" % wid, "volume": 0.8}]}
+              wav(OUT + "/sounds/guns/empty.wav", clicks(0.12, [(0.0, 1500, 1.0), (0.05, 900, 0.6)], 9))
+              defs["eclips.gun.empty"] = {"category": "neutral", "max_distance": 16,
+                                          "sounds": [{"name": "sounds/guns/empty", "volume": 0.8}]}
+              wjson(OUT + "/sounds/sound_definitions.json", {"format_version": "1.14.0", "sound_definitions": defs})
+
+              wjson(OUT + "/texts/languages.json", ["en_US", "ru_RU"])
+              en = ["itemGroup.name.guns=Guns"]
+              ru = ["itemGroup.name.guns=Оружие"]
+              for k, (e, r) in NAMES.items():
+                  for key in ("item.eclips:%s.name" % k, "item.eclips:%s" % k):
+                      en.append("%s=%s" % (key, e))
+                      ru.append("%s=%s" % (key, r))
+              w(OUT + "/texts/en_US.lang", "\n".join(en) + "\n")
+              w(OUT + "/texts/ru_RU.lang", "\n".join(ru) + "\n")
+
+              os.makedirs("src/main/resources", exist_ok=True)
+              zpath = "src/main/resources/guns_pack.zip"
+              with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+                  for root, _, files in os.walk(OUT):
+                      for fn in sorted(files):
+                          full = os.path.join(root, fn)
+                          z.write(full, os.path.relpath(full, OUT))
+              w("src/main/resources/pack.info", "uuid=%s\nversion=%s\n" % (PACK_UUID, ".".join(map(str, VERSION))))
+              print("pack ok:", zpath, os.path.getsize(zpath), "bytes, version", VERSION)
+
+          main()
+          PY_EOF
+          python3 staging/gen_pack.py
+
+      # ------------------------------------------------------------------
+      # 5. Сборка Maven (Java 17). Подбор варианта API кастомных предметов, затем заглушка.
+      # ------------------------------------------------------------------
+      - name: Build with Maven
+        run: |
+          set -e
+          SRC=src/main/java/ru/eclips/guns/CustomItems.java
+          built=0
+          n=0
+          for imp in cn.nukkit.item.customitem.data.CreativeCategory cn.nukkit.item.customitem.data.ItemCreativeCategory cn.nukkit.item.ItemCreativeCategory; do
+            enum="${imp##*.}"
+            for grp in 1 0; do
+              n=$((n+1))
+              sed -e "s|@CATIMPORT@|$imp|" -e "s|@CATENUM@|$enum|" staging/CustomItems.tpl > "$SRC"
+              if [ "$grp" = "0" ]; then sed -i '/\/\/GROUP/d' "$SRC"; fi
+              if mvn -B -q -DskipTests clean package > "build_$n.log" 2>&1; then
+                echo "::notice::Custom items OK: $imp, creativeGroup=$grp"
+                built=1
+                break 2
+              else
+                echo "Вариант $n ($imp, group=$grp) не собрался:"
+                grep -E "ERROR.*\.java|cannot find symbol|symbol:|location:" "build_$n.log" | head -n 12 || true
+              fi
+            done
+          done
+          if [ "$built" = "0" ]; then
+            echo "::warning::Кастомные предметы не собрались ни в одном варианте API. Собираю с заглушкой (ванильные предметы с NBT)."
+            cp staging/CustomItems.stub "$SRC"
+            mvn -B -DskipTests clean package
+          fi
+          ls -la target/Guns.jar
+
+      - name: Upload Guns.jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Guns
+          path: target/Guns.jar
+          if-no-files-found: error
